@@ -1,0 +1,237 @@
+name: Prisma Postgres Management API Workflow
+
+on:
+  pull_request:
+    types: [opened, reopened, closed]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        default: "provision"
+        type: choice
+        options:
+          - provision
+          - cleanup
+      database_name:
+        description: "Database name (for testing, will be sanitized)"
+        required: false
+        type: string
+
+env:
+  PRISMA_POSTGRES_MANAGEMENT: ${{ secrets.PRISMA_POSTGRES_MANAGEMENT }}
+  PRISMA_PROJECT: ${{ secrets.PRISMA_PROJECT }}
+  PRISMA_WORKSPACE: ${{ secrets.PRISMA_WORKSPACE }}
+  # Sanitize database name once at workflow level
+  DB_NAME: ${{ github.event.pull_request.number != null && format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.ref) || (inputs.database_name != '' && inputs.database_name || format('test-{0}', github.run_number)) }}
+
+# Prevent concurrent runs of the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provision-database:
+    if: github.event.action != 'closed' || (github.event_name == 'workflow_dispatch' && inputs.action == 'provision')
+    runs-on: ubuntu-latest
+    permissions: write-all
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Validate Environment Variables
+        run: |
+          if [ -z "${{ env.PRISMA_POSTGRES_MANAGEMENT }}" ]; then
+            echo "Error: PRISMA_POSTGRES_MANAGEMENT secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ env.PRISMA_PROJECT }}" ]; then
+            echo "Error: PRISMA_PROJECT secret is not set"
+            exit 1
+          fi
+
+      - name: Sanitize Database Name
+        run: |
+          # Sanitize the database name to match Prisma's requirements
+          DB_NAME="$(echo "${{ env.DB_NAME }}" | tr '/' '_' | tr '-' '_' | tr '[:upper:]' '[:lower:]')"
+          echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+
+      - name: Check If Database Exists
+        id: check-db
+        run: |
+          echo "Fetching all databases..."
+          RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ env.PRISMA_POSTGRES_MANAGEMENT }}" \
+            -H "Content-Type: application/json" \
+            "https://api.prisma.io/projects/${{ env.PRISMA_PROJECT }}/databases")
+
+          echo "Looking for database with name: ${{ env.DB_NAME }}"
+
+          # Extract database ID using jq to properly parse JSON
+          DB_EXISTS=$(echo "$RESPONSE" | jq -r ".data[]? | select(.name == \"${{ env.DB_NAME }}\") | .id")
+
+          if [ ! -z "$DB_EXISTS" ] && [ "$DB_EXISTS" != "null" ]; then
+            echo "Database ${{ env.DB_NAME }} exists with ID: $DB_EXISTS."
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "db-id=$DB_EXISTS" >> $GITHUB_OUTPUT
+          else
+            echo "No existing database found with name ${{ env.DB_NAME }}"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Database
+        id: create-db
+        if: steps.check-db.outputs.exists != 'true'
+        run: |
+          echo "Creating database ${{ env.DB_NAME }}..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ env.PRISMA_POSTGRES_MANAGEMENT }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"${{ env.DB_NAME }}\", \"region\": \"us-east-1\"}" \
+            "https://api.prisma.io/projects/${{ env.PRISMA_PROJECT }}/databases")
+
+          # Check if response contains an id (success case)
+          if echo "$RESPONSE" | grep -q '"id":'; then
+            echo "Database created successfully"
+            CONNECTION_STRING=$(echo "$RESPONSE" | jq -r '.connectionString')
+            echo "connection-string=$CONNECTION_STRING" >> $GITHUB_OUTPUT
+          else
+            echo "Failed to create database"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+      - name: Get Connection String for Existing Database
+        id: get-connection
+        if: steps.check-db.outputs.exists == 'true'
+        run: |
+          echo "Creating new connection string for existing database..."
+          CONNECTION_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ env.PRISMA_POSTGRES_MANAGEMENT }}" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"read_write_key"}' \
+            "https://api.prisma.io/projects/${{ env.PRISMA_PROJECT }}/databases/${{ steps.check-db.outputs.db-id }}/connections")
+
+          CONNECTION_STRING=$(echo "$CONNECTION_RESPONSE" | jq -r '.connectionString')
+          echo "connection-string=$CONNECTION_STRING" >> $GITHUB_OUTPUT
+
+      - name: Setup Database Schema
+        run: |
+          # Get connection string from appropriate step
+          if [ "${{ steps.check-db.outputs.exists }}" = "true" ]; then
+            CONNECTION_STRING="${{ steps.get-connection.outputs.connection-string }}"
+          else
+            CONNECTION_STRING="${{ steps.create-db.outputs.connection-string }}"
+          fi
+
+          # Set the DATABASE_URL
+          export DATABASE_URL="$CONNECTION_STRING"
+
+          # Generate Prisma Client
+          npx prisma generate
+
+          # Push schema to database
+          npx prisma db push
+
+      - name: Seed Database
+        run: |
+          # Get connection string from appropriate step
+          if [ "${{ steps.check-db.outputs.exists }}" = "true" ]; then
+            CONNECTION_STRING="${{ steps.get-connection.outputs.connection-string }}"
+          else
+            CONNECTION_STRING="${{ steps.create-db.outputs.connection-string }}"
+          fi
+
+          # Set the DATABASE_URL environment variable for the seed script
+          export DATABASE_URL="$CONNECTION_STRING"
+
+          # Run the seed script
+          npm run queries
+
+      - name: Comment PR
+        if: success() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🗄️ Database provisioned successfully!\n\nDatabase name: ${{ env.DB_NAME }}\nStatus: Ready and seeded with sample data`
+            })
+
+      - name: Output Database Info
+        if: success() && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "🗄️ Database provisioned successfully!"
+          echo "Database name: ${{ env.DB_NAME }}"
+          echo "Status: Ready and seeded with sample data"
+
+  cleanup-database:
+    if: github.event.action == 'closed' || (github.event_name == 'workflow_dispatch' && inputs.action == 'cleanup')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Environment Variables
+        run: |
+          if [ -z "${{ env.PRISMA_POSTGRES_MANAGEMENT }}" ]; then
+            echo "Error: PRISMA_POSTGRES_MANAGEMENT secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ env.PRISMA_PROJECT }}" ]; then
+            echo "Error: PRISMA_PROJECT secret is not set"
+            exit 1
+          fi
+
+      - name: Sanitize Database Name
+        run: |
+          # Sanitize the database name
+          DB_NAME="$(echo "${{ env.DB_NAME }}" | tr '/' '_' | tr '-' '_' | tr '[:upper:]' '[:lower:]')"
+          echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+
+      - name: Delete Database
+        run: |
+          echo "Fetching all databases..."
+          RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ env.PRISMA_POSTGRES_MANAGEMENT }}" \
+            -H "Content-Type: application/json" \
+            "https://api.prisma.io/projects/${{ env.PRISMA_PROJECT }}/databases")
+
+          echo "Looking for database with name: ${{ env.DB_NAME }}"
+
+          # Extract database ID using jq to properly parse JSON
+          DB_EXISTS=$(echo "$RESPONSE" | jq -r ".data[]? | select(.name == \"${{ env.DB_NAME }}\") | .id")
+
+          if [ ! -z "$DB_EXISTS" ] && [ "$DB_EXISTS" != "null" ]; then
+            echo "Database ${{ env.DB_NAME }} exists with ID: $DB_EXISTS. Deleting..."
+            DELETE_RESPONSE=$(curl -s -X DELETE \
+              -H "Authorization: Bearer ${{ env.PRISMA_POSTGRES_MANAGEMENT }}" \
+              -H "Content-Type: application/json" \
+              "https://api.prisma.io/projects/${{ env.PRISMA_PROJECT }}/databases/$DB_EXISTS")
+            
+            echo "Delete API Response: $DELETE_RESPONSE"
+            
+            if echo "$DELETE_RESPONSE" | grep -q '"error":'; then
+              ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.message // "Unknown error"')
+              echo "Failed to delete database: $ERROR_MSG"
+              exit 1
+            else
+              echo "Database deletion initiated successfully"
+            fi
+          else
+            echo "No existing database found with name ${{ env.DB_NAME }}"
+          fi
