@@ -1,4 +1,4 @@
-# Prisma Postgres Database Management with GitHub Actions
+# Prisma Postgres Database Management with GitHub Actions.
 
 This project demonstrates automated database provisioning and management using Prisma Postgres Management API integrated with GitHub Actions workflows.
 
